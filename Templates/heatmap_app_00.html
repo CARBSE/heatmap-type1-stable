@@ -1,0 +1,169 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8"/>
+  <meta name="viewport" content="width=device-width, initial-scale=1.0"/>
+  <title>CARBSE • Heatmap Generator (Type 1)</title>
+  <link rel="stylesheet"
+        href="https://stackpath.bootstrapcdn.com/bootstrap/4.5.2/css/bootstrap.min.css"/>
+  <style>
+    body { background: #f7f8fa; }
+    .card { border-radius: 14px; }
+    .sticky-topbar { position: sticky; top: 0; z-index: 100; background: #fff; }
+    .data-table { max-height: 260px; overflow: auto; }
+    .plot-holder { min-height: 320px; }
+    footer { color: #6c757d; }
+    .form-inline .form-group { margin-right: 12px; }
+    .form-control, .custom-select { border-radius: 10px; }
+    .btn { border-radius: 10px; }
+    .badge-pill { font-size: 90%; }
+    .table th, .table td { white-space: nowrap; }
+  </style>
+</head>
+<body>
+
+<div class="container py-3">
+  <!-- Alerts -->
+  {% with messages = get_flashed_messages(with_categories=true) %}
+    {% if messages %}
+      <div class="my-2">
+        {% for category, message in messages %}
+          <div class="alert alert-{{ category }} mb-2" role="alert">{{ message }}</div>
+        {% endfor %}
+      </div>
+    {% endif %}
+  {% endwith %}
+
+  <div class="d-flex align-items-center justify-content-between mb-3">
+    <h3 class="mb-0">CARBSE • Heatmap Generator (Type 1)</h3>
+    <span class="badge badge-secondary badge-pill">Single City</span>
+  </div>
+
+  <!-- Upload Card -->
+  <div class="card mb-3">
+    <div class="card-body">
+      <h5 class="card-title">1) Upload CSV</h5>
+      <p class="text-muted mb-2">Expected headers: <code>Timestamp</code>, <code>DBT</code>, <code>RH</code></p>
+      <form action="/upload" method="POST" enctype="multipart/form-data" class="form-inline">
+        <div class="form-group">
+          <input type="file" name="file" class="form-control-file" required>
+        </div>
+        <button type="submit" class="btn btn-primary ml-2">Upload</button>
+        {% if filename %}
+          <span class="ml-3 text-success">Uploaded: <strong>{{ filename }}</strong></span>
+        {% endif %}
+      </form>
+
+      {% if preview_rows %}
+      <hr/>
+      <h6 class="mb-2">Data preview (first 20 rows)</h6>
+      <div class="data-table">
+        <table class="table table-sm table-striped table-bordered bg-white mb-0">
+          <thead class="thead-light">
+          <tr>
+            {% for col in columns %}
+              <th>{{ col }}</th>
+            {% endfor %}
+          </tr>
+          </thead>
+          <tbody>
+          {% for row in preview_rows %}
+            <tr>
+              {% for col in columns %}
+                <td>{{ row.get(col) }}</td>
+              {% endfor %}
+            </tr>
+          {% endfor %}
+          </tbody>
+        </table>
+      </div>
+      {% endif %}
+    </div>
+  </div>
+
+  <!-- Controls + Plot -->
+  <div class="card mb-4">
+    <div class="card-body">
+      <h5 class="card-title">2) Configure & Generate</h5>
+
+      <form action="/generate-heatmap" method="POST">
+        <input type="hidden" name="session_id" value="{{ session_id }}"/>
+
+        <div class="form-row">
+          <div class="form-group col-md-3">
+            <label>Variable</label>
+            <select name="parameter" id="parameter" class="custom-select" required>
+              <option value="DBT" {% if selected_parameter == 'DBT' %}selected{% endif %}>DBT</option>
+              <option value="RH"  {% if selected_parameter == 'RH' %}selected{% endif %}>RH</option>
+            </select>
+          </div>
+
+          <div class="form-group col-md-3">
+            <label>Scale maximum</label>
+            <input type="number" step="any" min="0" name="scale_max"
+                   id="scale_max"
+                   class="form-control"
+                   value="{{ scale_max if scale_max is defined else scale_max_default }}"/>
+            <small class="form-text text-muted">
+              Defaults: DBT=50, RH=100
+            </small>
+          </div>
+
+          <div class="form-group col-md-3">
+            <label>Image width (px)</label>
+            <input type="number" name="img_width" class="form-control"
+                   value="{{ width if width is defined else 1200 }}" min="600"/>
+          </div>
+
+          <div class="form-group col-md-3">
+            <label>Image height (px)</label>
+            <input type="number" name="img_height" class="form-control"
+                   value="{{ height if height is defined else 600 }}" min="300"/>
+          </div>
+        </div>
+
+        <button type="submit" class="btn btn-dark">Generate Heatmap</button>
+        {% if session_id %}
+          <a href="/download/jpg/{{ session_id }}" class="btn btn-outline-secondary ml-2">Download JPG</a>
+          <a href="/download/csv/{{ session_id }}" class="btn btn-outline-secondary ml-1">Download CSV</a>
+        {% endif %}
+      </form>
+
+      <hr/>
+      <div class="plot-holder">
+        {% if graph_html %}
+          {{ graph_html | safe }}
+        {% else %}
+          <div class="text-muted">No plot yet. Upload a CSV and click <em>Generate Heatmap</em>.</div>
+        {% endif %}
+      </div>
+    </div>
+  </div>
+
+  <footer class="text-center small mb-3">
+    © {{ 2025 }} CARBSE • Built with Flask + Plotly
+  </footer>
+</div>
+
+<script>
+  // Auto-suggest scale max when parameter changes (only overwrites if current matches default)
+  (function () {
+    const paramEl = document.getElementById('parameter');
+    const scaleEl = document.getElementById('scale_max');
+    if (!paramEl || !scaleEl) return;
+
+    function defaultFor(param) { return param === 'RH' ? 100 : 50; }
+
+    paramEl.addEventListener('change', function () {
+      const def = defaultFor(paramEl.value);
+      // If user hasn't customized (i.e., value matches previous default), set new default
+      const current = parseFloat(scaleEl.value || def);
+      const oldDef = defaultFor(paramEl.value === 'RH' ? 'DBT' : 'RH');
+      if (current === oldDef) {
+        scaleEl.value = def;
+      }
+    });
+  })();
+</script>
+</body>
+</html>
