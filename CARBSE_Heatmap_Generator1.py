@@ -23,7 +23,7 @@ import plotly.graph_objects as go
 # -----------------------------------------------------------------------------
 # If your templates folder is capitalized on Windows, keep the default lower-case
 # on Linux. Make sure your repo path is: templates/heatmap_app_00.html
-app = Flask(__name__, template_folder="Templates")
+app = Flask(__name__)
 app.secret_key = os.environ.get("SECRET_KEY", "dev-key-change-me")
 
 # Simple in-memory cache is fine for single worker
