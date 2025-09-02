@@ -71,7 +71,7 @@
       {% if messages %}
         <div class="vstack">
           {% for cat, msg in messages %}
-            <div class="card" style="border-left:4px solid {% if cat=='danger' %#ef4444{% elif cat=='warning'%#f59e0b{% else %}#22c55e{% endif %};">
+            <div class="card" style="border-left:4px solid {% if cat=='danger' %}#ef4444{% elif cat=='warning' %}#f59e0b{% else %}#22c55e{% endif %};">
               {{ msg }}
             </div>
           {% endfor %}
