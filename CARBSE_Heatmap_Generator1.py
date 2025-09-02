@@ -20,7 +20,7 @@ from flask import (
 from werkzeug.utils import secure_filename
 
 # ───────────────────────────── Config ─────────────────────────────
-app = Flask(__name__)
+app = Flask(__name__, template_folder="Templates")
 app.secret_key = os.environ.get("SECRET_KEY", "change-this-secret")
 app.permanent_session_lifetime = timedelta(days=3)
 
