@@ -1,258 +1,319 @@
-<!DOCTYPE html>
+<!doctype html>
 <html lang="en">
 <head>
   <meta charset="utf-8"/>
   <meta name="viewport" content="width=device-width, initial-scale=1"/>
   <title>CARBSE • Heatmap Generator (Type 1)</title>
-  <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/bootstrap@4.6.2/dist/css/bootstrap.min.css"/>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600&display=swap" rel="stylesheet">
   <style>
-    body { background:#f6f7fb; }
-    .card { border-radius:12px; box-shadow:0 1px 3px rgba(0,0,0,0.06); }
-    .form-section h5 { font-weight:600; }
-    .sticky-actions { position: sticky; bottom: 0; background: #fff; padding: .75rem; border-top: 1px solid #eee; }
-    .legend { font-size:.9rem; color:#666; }
-    .tab-content { background:#fff; border:1px solid #e9ecef; border-top:0; padding:1rem; border-radius:0 0 .5rem .5rem; }
+    :root{
+      --bg:#f4f6fb;
+      --card:#ffffff;
+      --ink:#0f172a;
+      --muted:#6b7280;
+      --brand:#2563eb;
+      --brand-2:#1e40af;
+      --line:#e5e7eb;
+      --pill:#eef2ff;
+    }
+    *{box-sizing:border-box}
+    body{
+      margin:0; background:var(--bg); color:var(--ink);
+      font-family:Inter, system-ui, -apple-system, Segoe UI, Roboto, "Helvetica Neue", Arial, "Noto Sans", "Apple Color Emoji", "Segoe UI Emoji";
+    }
+    .wrap{max-width:1200px; margin:24px auto; padding:0 16px}
+    .header{
+      margin-bottom:18px;
+      display:flex; align-items:center; justify-content:space-between;
+    }
+    h1{
+      font-weight:600; font-size:22px; letter-spacing:.2px; margin:0;
+    }
+    .pill{background:var(--pill); color:var(--brand-2); padding:4px 10px; border-radius:999px; font-size:12px; font-weight:600}
+    .card{
+      background:var(--card); border-radius:16px; box-shadow:0 8px 24px rgba(17,24,39,.06);
+      border:1px solid var(--line); overflow:hidden; margin-bottom:18px;
+    }
+    .card .title{
+      padding:14px 18px; border-bottom:1px solid var(--line); font-weight:600;
+      background:linear-gradient(180deg,#fff, #fafbff);
+    }
+    .card .body{ padding:18px; }
+    .row{display:grid; grid-template-columns:repeat(12,1fr); gap:12px}
+    .col-12{grid-column:span 12}
+    .col-6{grid-column:span 6}
+    .col-4{grid-column:span 4}
+    .col-3{grid-column:span 3}
+    @media (max-width: 900px){
+      .col-6,.col-4,.col-3{grid-column:span 12}
+    }
+    label{display:block; font-size:12px; color:var(--muted); margin:6px 0 6px 2px}
+    input[type="text"], input[type="number"], input[type="time"], select{
+      width:100%; padding:10px 12px; border-radius:10px; border:1px solid var(--line); outline:none;
+      font-size:14px; background:#fff;
+    }
+    .btn{
+      display:inline-flex; align-items:center; gap:8px;
+      background:var(--brand); color:#fff; border:0; padding:10px 14px; border-radius:12px;
+      font-weight:600; cursor:pointer; box-shadow:0 6px 16px rgba(37,99,235,.25);
+    }
+    .btn.secondary{ background:#eef2ff; color:var(--brand-2); box-shadow:none; }
+    .btn.icon{ padding:8px 10px }
+    .muted{ color:var(--muted); }
+    .hint{ font-size:12px; color:var(--muted); margin-top:6px }
+    .tabs{ display:flex; gap:12px; border-bottom:1px solid var(--line); padding:0 18px }
+    .tab{
+      padding:12px 10px; font-weight:600; color:var(--muted); border-bottom:2px solid transparent; cursor:pointer; text-decoration:none;
+    }
+    .tab.active{ color:var(--brand-2); border-color:var(--brand-2) }
+    .plot-card{ padding: 6px 18px 18px }
+    .plot-wrap{ background:#fff; border-radius:12px; border:1px solid var(--line); padding:12px; }
+    /* Keep plot inside the card */
+    .plot-wrap{ overflow:hidden; }
+    .plot-wrap .js-plotly-plot,
+    .plot-wrap .plot-container,
+    .plot-wrap .plotly,
+    .plot-wrap svg,
+    .plot-wrap .main-svg {
+      max-width:100% !important;
+    }
+    .kgroup{
+      display:flex; flex-wrap:wrap; gap:16px; align-items:end;
+    }
+    .color-grid{ display:grid; grid-template-columns:repeat(4, minmax(0,1fr)); gap:6px; }
+    .color-grid label{ display:flex; align-items:center; gap:8px; padding:6px 8px; border:1px solid var(--line); border-radius:10px; cursor:pointer; }
+    .footer-note{ text-align:center; color:var(--muted); font-size:12px; padding:24px 0 6px }
+    table { border-collapse: collapse; width: 100%;}
+    th, td { padding: 8px 10px; border-bottom: 1px solid var(--line); }
+    th { background: #f9fafb; text-align: left; font-weight:600 }
   </style>
 </head>
-
 <body>
-<div class="container py-4">
-  <div class="d-flex align-items-center mb-3">
-    <h3 class="mb-0">CARBSE • Heatmap Generator (Type 1)</h3>
-    <span class="badge badge-secondary ml-2">Single City</span>
-  </div>
-
-  <!-- Upload -->
-  <div class="card mb-3">
-    <div class="card-body">
-      <h5 class="mb-3">1) Upload CSV</h5>
-      <p class="mb-1"><span class="text-muted">Expected headers:</span> <code>Timestamp</code>, <code>DBT</code>, <code>RH</code></p>
-
-      <form action="/upload" method="POST" enctype="multipart/form-data" class="form-inline">
-        <div class="form-group mr-2">
-          <input type="file" name="file" class="form-control-file" required>
-        </div>
-        <button type="submit" class="btn btn-primary">Upload</button>
-      </form>
+  <div class="wrap">
+    <div class="header">
+      <h1>CARBSE • Heatmap Generator (Type 1)</h1>
+      <div class="pill">Single City</div>
     </div>
-  </div>
 
-  <!-- Config & Generate -->
-  <div class="card mb-3">
-    <div class="card-body">
-      <h5 class="mb-3">2) Configure & Generate</h5>
-
-      <form action="/generate-heatmap" method="POST" id="cfgForm">
-        <input type="hidden" name="session_id" value="{{ session_id }}"/>
-
-        <div class="form-row">
-          <div class="form-group col-md-3">
-            <label>Variable</label>
-            <select class="form-control" name="variable" id="variable">
-              <option value="DBT" {% if state.variable=='DBT' %}selected{% endif %}>DBT</option>
-              <option value="RH"  {% if state.variable=='RH'  %}selected{% endif %}>RH</option>
-            </select>
+    <!-- Upload -->
+    <div class="card">
+      <div class="title">1) Upload CSV</div>
+      <div class="body">
+        <form method="post" action="{{ url_for('upload') }}" enctype="multipart/form-data" class="kgroup">
+          <div class="col-6">
+            <label>Choose CSV/XLSX <span class="muted">(Expected headers: <b>Timestamp, DBT, RH</b>)</span></label>
+            <input type="file" name="file" accept=".csv,.xlsx,.xls"/>
           </div>
-
-          <div class="form-group col-md-3">
-            <label>Scale minimum</label>
-            <input type="number" step="any" class="form-control" name="scale_min" value="{{ state.scale_min }}">
-          </div>
-
-          <div class="form-group col-md-3">
-            <label>Scale maximum</label>
-            <input type="number" step="any" class="form-control" id="scale_max" name="scale_max" value="{{ state.scale_max }}">
-            <div class="legend">Defaults: DBT=50, RH=100</div>
-          </div>
-
-          <div class="form-group col-md-3">
-            <label>Legend step</label>
-            <input type="number" step="any" class="form-control" name="legend_step" value="{{ state.legend_step }}">
-          </div>
-        </div>
-
-        <div class="form-row">
-          <div class="form-group col-md-3">
-            <label>Image width (px)</label>
-            <input type="number" class="form-control" name="img_w" value="{{ state.img_w }}">
-          </div>
-          <div class="form-group col-md-3">
-            <label>Image height (px)</label>
-            <input type="number" class="form-control" name="img_h" value="{{ state.img_h }}">
-          </div>
-          <div class="form-group col-md-3">
-            <label>Show grid</label>
-            <select name="show_grid" class="form-control">
-              <option value="yes" {% if state.show_grid=='yes' %}selected{% endif %}>Yes</option>
-              <option value="no"  {% if state.show_grid=='no'  %}selected{% endif %}>No</option>
-            </select>
-          </div>
-          <div class="form-group col-md-3">
-            <label>Missing value colour</label>
-            <select name="missing_color" class="form-control">
-              {% for c in ['white','grey','black','red','yellow','blue','cyan','navyblue','darkred'] %}
-                <option value="{{c}}" {% if state.missing_color==c %}selected{% endif %}>{{c|capitalize}}</option>
-              {% endfor %}
-            </select>
-          </div>
-        </div>
-
-        <hr>
-
-        <div class="form-row">
-          <div class="form-group col-md-4">
-            <label>Choose your date format</label>
-            <div class="border rounded p-2">
-              {% for lab in ['Jan-17','01-Jan','01-01-17','01-January','Mon','Monday','Jan','01','17','2017'] %}
-              <div class="custom-control custom-radio">
-                <input class="custom-control-input" id="fmt_{{loop.index}}" type="radio" name="x_tickfmt" value="{{lab}}" {% if state.x_tickfmt==lab %}checked{% endif %}>
-                <label class="custom-control-label" for="fmt_{{loop.index}}">{{lab}}</label>
-              </div>
-              {% endfor %}
-            </div>
-          </div>
-
-          <div class="form-group col-md-4">
-            <label>X-axis represented by</label>
-            <select name="x_resolution" class="form-control">
-              {% for opt in ['days','weeks','months','years'] %}
-                <option value="{{opt}}" {% if state.x_resolution==opt %}selected{% endif %}>{{opt}}</option>
-              {% endfor %}
-            </select>
-
-            <label class="mt-3">Colour range (check 2+)</label>
-            <div class="border rounded p-2" style="max-height:180px;overflow:auto">
-              {% set choices = ['white','navyblue','blue','cyan','yellow','red','darkred','black'] %}
-              {% for c in choices %}
-              <div class="custom-control custom-checkbox">
-                <input class="custom-control-input" id="clr_{{c}}" type="checkbox" name="range_colors" value="{{c}}"
-                  {% if c in state.range_colors %}checked{% endif %}>
-                <label class="custom-control-label" for="clr_{{c}}">{{c|capitalize}}</label>
-              </div>
-              {% endfor %}
-            </div>
-          </div>
-
-          <div class="form-group col-md-4">
-            <label>Title</label>
-            <input type="text" class="form-control" name="title" value="{{ state.title }}">
-            <label class="mt-2">X-axis name</label>
-            <input type="text" class="form-control" name="x_label" value="{{ state.x_label }}">
-            <label class="mt-2">Y-axis name</label>
-            <input type="text" class="form-control" name="y_label" value="{{ state.y_label }}">
-            <label class="mt-2">Legend name</label>
-            <input type="text" class="form-control" name="legend_label" value="{{ state.legend_label }}">
-          </div>
-        </div>
-
-        <hr>
-
-        <div class="form-row">
-          <div class="form-group col-md-6">
-            <label>Add upper band limit time</label>
-            <div class="form-row">
-              <div class="col-5">
-                <input type="time" class="form-control" name="upper_time" value="{{ state.upper_time }}">
-              </div>
-              <div class="col-4">
-                <select class="form-control" name="upper_style">
-                  {% for s in ['dotted','dashed','solid'] %}
-                  <option value="{{s}}" {% if state.upper_style==s %}selected{% endif %}>{{s}}</option>
-                  {% endfor %}
-                </select>
-              </div>
-              <div class="col-3">
-                <select class="form-control" name="upper_color">
-                  {% for c in ['black','red','blue','cyan','yellow'] %}
-                  <option value="{{c}}" {% if state.upper_color==c %}selected{% endif %}>{{c}}</option>
-                  {% endfor %}
-                </select>
-              </div>
-            </div>
-          </div>
-
-          <div class="form-group col-md-6">
-            <label>Add lower band limit time</label>
-            <div class="form-row">
-              <div class="col-5">
-                <input type="time" class="form-control" name="lower_time" value="{{ state.lower_time }}">
-              </div>
-              <div class="col-4">
-                <select class="form-control" name="lower_style">
-                  {% for s in ['dotted','dashed','solid'] %}
-                  <option value="{{s}}" {% if state.lower_style==s %}selected{% endif %}>{{s}}</option>
-                  {% endfor %}
-                </select>
-              </div>
-              <div class="col-3">
-                <select class="form-control" name="lower_color">
-                  {% for c in ['black','red','blue','cyan','yellow'] %}
-                  <option value="{{c}}" {% if state.lower_color==c %}selected{% endif %}>{{c}}</option>
-                  {% endfor %}
-                </select>
-              </div>
-            </div>
-          </div>
-        </div>
-
-        <div class="sticky-actions d-flex justify-content-between align-items-center">
           <div>
-            <button type="submit" class="btn btn-dark">Generate Heatmap</button>
-            {% if session_id %}
-              <a class="btn btn-outline-secondary ml-2" href="/download/jpg/{{session_id}}" download>Download the plot</a>
-              <a class="btn btn-outline-secondary ml-2" href="/download/csv/{{session_id}}" download>Download CSV</a>
+            <button class="btn" type="submit">Upload</button>
+          </div>
+        </form>
+        {% if detected_cols %}
+          <div class="hint">Detected columns: {{ detected_cols|join(", ") }}</div>
+        {% endif %}
+      </div>
+    </div>
+
+    <!-- Configure -->
+    <div class="card">
+      <div class="title">2) Configure & Generate</div>
+      <div class="body">
+        <form method="post" action="{{ url_for('generate_heatmap') }}">
+          <div class="row">
+            <div class="col-3">
+              <label>Variable</label>
+              <select name="variable" id="variable">
+                <option value="DBT">DBT</option>
+                <option value="RH">RH</option>
+              </select>
+            </div>
+            <div class="col-3">
+              <label>Scale minimum</label>
+              <input type="number" step="any" name="scale_min" placeholder="0"/>
+            </div>
+            <div class="col-3">
+              <label>Scale maximum</label>
+              <input type="number" step="any" name="scale_max" id="scale_max" placeholder="DBT→50, RH→100"/>
+            </div>
+            <div class="col-3">
+              <label>Missing value color</label>
+              <select name="missing_color">
+                <option>Grey</option>
+                <option>White</option>
+                <option>Black</option>
+              </select>
+            </div>
+          </div>
+
+          <div class="row" style="margin-top:8px">
+            <div class="col-3">
+              <label>Upper band time</label>
+              <input type="time" name="upper_band_time" value="09:00"/>
+            </div>
+            <div class="col-3">
+              <label>Type</label>
+              <select name="upper_band_style">
+                <option value="dotted" selected>dotted</option>
+                <option value="solid">solid</option>
+              </select>
+            </div>
+            <div class="col-3">
+              <label>Color</label>
+              <select name="upper_band_color">
+                <option>black</option><option>red</option><option>blue</option><option>yellow</option>
+              </select>
+            </div>
+          </div>
+
+          <div class="row" style="margin-top:4px">
+            <div class="col-3">
+              <label>Lower band time</label>
+              <input type="time" name="lower_band_time" value="18:00"/>
+            </div>
+            <div class="col-3">
+              <label>Type</label>
+              <select name="lower_band_style">
+                <option value="dotted" selected>dotted</option>
+                <option value="solid">solid</option>
+              </select>
+            </div>
+            <div class="col-3">
+              <label>Color</label>
+              <select name="lower_band_color">
+                <option>black</option><option>red</option><option>blue</option><option>yellow</option>
+              </select>
+            </div>
+          </div>
+
+          <div class="row" style="margin-top:12px">
+            <div class="col-12">
+              <label>Select range of colours</label>
+              <div class="color-grid">
+                {% for c in ["White","Navyblue","Blue","Cyan","Yellow","Red","Darkred","Black"] %}
+                  <label><input type="checkbox" name="colors" value="{{ c }}" {% if c in ["Blue","Cyan","Yellow","Red"] %}checked{% endif %}> {{ c }}</label>
+                {% endfor %}
+              </div>
+              <div class="hint">Choose 2–8 colors; order matters (left→right).</div>
+            </div>
+          </div>
+
+          <div class="row" style="margin-top:12px">
+            <div class="col-3">
+              <label>Date axis format</label>
+              <select name="date_fmt">
+                <option value="mon2y" selected>Abbrev. month – 2-digit year (Jan-17)</option>
+                <option value="ddmmyy">Decimal date – 2-digit year (01-01-17)</option>
+                <option value="ddmonfull">Decimal date – Full month (01-January)</option>
+                <option value="mon3">Abbrev. month (Jan)</option>
+                <option value="ddmon">Day-month (01-Jan)</option>
+                <option value="dow3">Abbrev. weekday (Mon)</option>
+                <option value="dowfull">Full weekday (Monday)</option>
+                <option value="mm">2-digit month (01)</option>
+                <option value="yyyy">4-digit year (2017)</option>
+              </select>
+            </div>
+            <div class="col-3">
+              <label>X-axis represented by</label>
+              <select name="x_repr">
+                <option value="months" selected>months</option>
+                <option value="days">days</option>
+              </select>
+            </div>
+            <div class="col-3">
+              <label>Image width (px)</label>
+              <input type="number" name="image_width" value="1200"/>
+            </div>
+            <div class="col-3">
+              <label>Image height (px)</label>
+              <input type="number" name="image_height" value="600"/>
+            </div>
+          </div>
+
+          <div class="row" style="margin-top:12px">
+            <div class="col-4">
+              <label>Title</label>
+              <input type="text" name="title" placeholder="Heatmap"/>
+            </div>
+            <div class="col-4">
+              <label>X-axis name</label>
+              <input type="text" name="x_name" value="Date"/>
+            </div>
+            <div class="col-4">
+              <label>Y-axis name</label>
+              <input type="text" name="y_name" value="Hour"/>
+            </div>
+          </div>
+          <div class="row" style="margin-top:8px">
+            <div class="col-4">
+              <label>Legend name</label>
+              <input type="text" name="legend_name" id="legend_name" placeholder="DBT / RH"/>
+            </div>
+          </div>
+
+          <div style="margin-top:16px; display:flex; gap:10px; align-items:center">
+            <button class="btn" type="submit">Generate Heatmap</button>
+            {% if last_plot_id %}
+              <a class="btn secondary" href="{{ url_for('download_jpg', plot_id=last_plot_id) }}">Download JPG</a>
             {% endif %}
           </div>
-          <small class="text-muted">© 2025 CARBSE • Built with Flask + Plotly</small>
+          <div class="hint" style="margin-top:8px">Web plot is responsive to the card; JPG uses your fixed width/height.</div>
+        </form>
+      </div>
+    </div>
+
+    <!-- Tabs / Plot + Data -->
+    <div class="card">
+      <div class="tabs">
+        <a class="tab active">Heatmap</a>
+        <a class="tab">Data</a>
+      </div>
+      <div class="plot-card">
+        <div class="plot-wrap">
+          {% if plot_html %}
+            {{ plot_html|safe }}
+          {% elif not has_data %}
+            <div class="muted" style="padding:16px">No plot yet. Upload a CSV and click <b>Generate Heatmap</b>.</div>
+          {% else %}
+            <div class="muted" style="padding:16px">Upload done. Configure options above and click <b>Generate Heatmap</b>.</div>
+          {% endif %}
         </div>
-      </form>
+      </div>
+      <div class="body">
+        {% if data_html %}
+          <div class="muted" style="margin-bottom:6px">Preview (first 100 rows)</div>
+          {{ data_html|safe }}
+        {% endif %}
+      </div>
     </div>
+
+    <div class="footer-note">© 2025 CARBSE • Built with Flask + Plotly</div>
   </div>
 
-  <!-- Tabs -->
-  <ul class="nav nav-tabs" id="tabs">
-    <li class="nav-item">
-      <a class="nav-link active" data-toggle="tab" href="#heat">Heatmap</a>
-    </li>
-    <li class="nav-item">
-      <a class="nav-link" data-toggle="tab" href="#data">Data</a>
-    </li>
-  </ul>
+  <script>
+    // Auto default scale max based on variable
+    const variableSel = document.getElementById('variable');
+    const scaleMaxInp = document.getElementById('scale_max');
+    const legendInp   = document.getElementById('legend_name');
 
-  <div class="tab-content mb-5">
-    <div class="tab-pane fade show active" id="heat">
-      {% if graph_html %}
-        <div class="mt-3">{{ graph_html | safe }}</div>
-      {% else %}
-        <p class="text-muted mb-0 mt-3">No plot yet. Upload a CSV and click <em>Generate Heatmap</em>.</p>
-      {% endif %}
-    </div>
-
-    <div class="tab-pane fade" id="data">
-      {% if table_html %}
-        <div class="table-responsive mt-3">{{ table_html | safe }}</div>
-      {% else %}
-        <p class="text-muted mb-0 mt-3">Data preview will appear here after you upload a CSV.</p>
-      {% endif %}
-    </div>
-  </div>
-</div>
-
-<script src="https://code.jquery.com/jquery-3.5.1.slim.min.js"></script>
-<script src="https://cdn.jsdelivr.net/npm/bootstrap@4.6.2/dist/js/bootstrap.bundle.min.js"></script>
-<script>
-  // Auto-fill sensible scale max by variable choice (DBT=50, RH=100) if empty
-  (function(){
-    var sel = document.getElementById('variable');
-    var scaleMax = document.getElementById('scale_max');
-    function setDefault() {
-      if (!scaleMax.value) {
-        scaleMax.value = (sel.value === 'RH') ? 100 : 50;
+    function setDefaults() {
+      const v = (variableSel?.value || "DBT").toUpperCase();
+      if(!scaleMaxInp.value){
+        scaleMaxInp.placeholder = v === "DBT" ? "50" : "100";
+      }
+      if(!legendInp.value){
+        legendInp.placeholder = v;
       }
     }
-    sel.addEventListener('change', setDefault);
-    setDefault();
-  })();
-</script>
+    variableSel?.addEventListener('change', setDefaults);
+    setDefaults();
+
+    // Resize safeguard (usually not needed because config.responsive = true)
+    window.addEventListener('resize', () => {
+      const gd = document.querySelector('.plot-wrap .js-plotly-plot');
+      if (gd && window.Plotly) Plotly.Plots.resize(gd);
+    });
+  </script>
 </body>
 </html>
