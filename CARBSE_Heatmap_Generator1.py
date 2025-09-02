@@ -1,324 +1,297 @@
 # -*- coding: utf-8 -*-
 """
-CARBSE Heatmap Generator (Type 1) – modern UI + stable session
-- Single-worker friendly: keeps uploaded CSV per-session on disk and in memory
-- Responsive Plotly graph inside a card (no overflow)
-- DBT/RH defaults for color scale max (DBT=50, RH=100)
-- JPG download via Kaleido
+CARBSE Heatmap Generator (Type 1)
+- Modern UI + all classic controls restored
+- Works with single worker (recommended) and session-safe uploads
 """
+
 import os
+import io
 import uuid
-from datetime import timedelta
+from datetime import datetime
 
 import pandas as pd
-import numpy as np
-import plotly.graph_objects as go
 from flask import (
     Flask, render_template, request, redirect, url_for,
-    send_file, flash, make_response
+    send_file, session, flash
 )
-from werkzeug.utils import secure_filename
+from flask_caching import Cache
+import plotly.graph_objects as go
 
-# ───────────────────────────── Config ─────────────────────────────
+# -----------------------------------------------------------------------------
+# Flask setup
+# -----------------------------------------------------------------------------
+# If your templates folder is capitalized on Windows, keep the default lower-case
+# on Linux. Make sure your repo path is: templates/heatmap_app_00.html
 app = Flask(__name__, template_folder="Templates")
-app.secret_key = os.environ.get("SECRET_KEY", "change-this-secret")
-app.permanent_session_lifetime = timedelta(days=3)
+app.secret_key = os.environ.get("SECRET_KEY", "dev-key-change-me")
 
-BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-UPLOAD_ROOT = os.path.join(BASE_DIR, "uploads")
-PLOT_ROOT = os.path.join(BASE_DIR, "plots")
-os.makedirs(UPLOAD_ROOT, exist_ok=True)
-os.makedirs(PLOT_ROOT, exist_ok=True)
+# Simple in-memory cache is fine for single worker
+cache = Cache(config={"CACHE_TYPE": "SimpleCache", "CACHE_DEFAULT_TIMEOUT": 60 * 60})
+cache.init_app(app)
 
-# In-memory map (single worker only)
-SESSIONS = {}  # session_id -> {"file": path}
+# -----------------------------------------------------------------------------
+# Constants & helpers
+# -----------------------------------------------------------------------------
+REQUIRED_COLS = ["Timestamp", "DBT", "RH"]
 
-ALLOWED_EXT = {".csv", ".xlsx", ".xls"}
+DEFAULTS = {
+    "DBT": {"zmin": 0.0, "zmax": 50.0},
+    "RH": {"zmin": 0.0, "zmax": 100.0},
+}
 
+# Exact palette requested (White → Navyblue → Blue → Cyan → Yellow → Red → Darkred → Black)
+COLOR_MAP = {
+    "White":   "#FFFFFF",
+    "Navyblue": "#001f3f",
+    "Blue":    "#0074D9",
+    "Cyan":    "#00FFFF",
+    "Yellow":  "#FFDC00",
+    "Red":     "#FF4136",
+    "Darkred": "#8B0000",
+    "Black":   "#000000",
+}
+FULL_SCALE_NAMES = ["White", "Navyblue", "Blue", "Cyan", "Yellow", "Red", "Darkred", "Black"]
 
-# ─────────────────────── Utility: parse datetime ───────────────────────
-def parse_datetime(series: pd.Series) -> pd.Series:
-    """Try to parse a 'Timestamp' robustly."""
-    # First attempt: general
-    dt = pd.to_datetime(series, errors="coerce")
-    # If mostly NaT, try dayfirst
-    if dt.isna().mean() > 0.5:
-        dt = pd.to_datetime(series, errors="coerce", dayfirst=True)
-    return dt
+def make_colorscale(names):
+    # even stops across 0..1
+    if len(names) == 1:
+        return [[0, COLOR_MAP[names[0]]], [1, COLOR_MAP[names[0]]]]
+    stops = []
+    n = len(names) - 1
+    for i, nm in enumerate(names):
+        stops.append([i / n, COLOR_MAP[nm]])
+    return stops
 
+DATE_TICK_FORMATS = {
+    "mon2yr": "%b-%y",          # Jan-17
+    "dd-mon": "%d-%b",          # 01-Jan
+    "dd-mm-yy": "%d-%m-%y",     # 01-01-17
+    "dd-fullmon": "%d-%B",      # 01-January
+    "wk-abbr": "%a",            # Mon
+    "wk-full": "%A",            # Monday
+    "mon-abbr": "%b",           # Jan
+    "mon-01": "%m",             # 01
+    "yy": "%y",                 # 17
+    "yyyy": "%Y",               # 2017
+}
 
-# ─────────────────────── Utility: colorscale ───────────────────────
-def carbse_colorscale():
-    """
-    Custom 8-color gradient:
-    White → Navy → Blue → Cyan → Yellow → Red → Dark Red → Black
-    """
-    return [
-        [0.00, "#FFFFFF"],  # White
-        [0.14, "#001f3f"],  # Navy blue
-        [0.28, "#0074D9"],  # Blue
-        [0.42, "#7FDBFF"],  # Cyan
-        [0.56, "#FFDC00"],  # Yellow
-        [0.70, "#FF4136"],  # Red
-        [0.84, "#85144b"],  # Dark red
-        [1.00, "#000000"],  # Black
-    ]
+def _session_key():
+    if "sid" not in session:
+        session["sid"] = uuid.uuid4().hex
+    return f"upload:{session['sid']}"
 
+def _coerce_df(df: pd.DataFrame) -> pd.DataFrame:
+    # normalize column names
+    df = df.copy()
+    df.columns = [c.strip() for c in df.columns]
+    missing = [c for c in REQUIRED_COLS if c not in df.columns]
+    if missing:
+        raise ValueError(f"Missing required columns: {', '.join(missing)}")
 
-# ─────────────────────── Helpers: session & file ───────────────────────
-def get_or_create_session_id(resp=None):
-    sid = request.cookies.get("session_id")
-    if not sid:
-        sid = str(uuid.uuid4())
-        if resp is None:
-            resp = make_response()
-        resp.set_cookie("session_id", sid, max_age=60 * 60 * 24 * 3, samesite="Lax")
-    return sid, resp
+    # Parse timestamp safely
+    ts = pd.to_datetime(df["Timestamp"], errors="coerce", dayfirst=True)
+    if ts.isna().all():
+        # try without dayfirst
+        ts = pd.to_datetime(df["Timestamp"], errors="coerce")
+    if ts.isna().any():
+        df = df.loc[~ts.isna()].copy()
+        ts = ts.loc[~ts.isna()]
+    df["Timestamp"] = ts
+    df["Date"] = df["Timestamp"].dt.normalize()
+    df["Hour"] = df["Timestamp"].dt.hour
+    return df
 
+def _read_upload(file_storage) -> pd.DataFrame:
+    filename = file_storage.filename
+    data = file_storage.read()
+    if not data:
+        raise ValueError("Empty file.")
+    buf = io.BytesIO(data)
+    if filename.lower().endswith((".xlsx", ".xls")):
+        df = pd.read_excel(buf)
+    else:
+        df = pd.read_csv(buf)
+    return _coerce_df(df)
 
-def session_upload_dir(session_id: str) -> str:
-    path = os.path.join(UPLOAD_ROOT, session_id)
-    os.makedirs(path, exist_ok=True)
-    return path
+def _pivot(df: pd.DataFrame, parameter: str) -> pd.DataFrame:
+    # daily (columns) × hour (rows)
+    pt = df.pivot_table(index="Hour", columns="Date", values=parameter, aggfunc="mean")
+    # ensure clean axes
+    pt = pt.sort_index(axis=0).sort_index(axis=1)
+    # keep full 0..23 even if missing (fills NaN)
+    pt = pt.reindex(range(0, 24))
+    return pt
 
+def _build_fig(pt: pd.DataFrame, parameter: str, zmin: float, zmax: float,
+               date_fmt_key: str, tickfont_size: int, height: int):
+    colorscale = make_colorscale(FULL_SCALE_NAMES)
+    fig = go.Figure(
+        data=go.Heatmap(
+            x=pt.columns, y=pt.index, z=pt.values,
+            colorscale=colorscale,
+            zmin=zmin, zmax=zmax,
+            colorbar=dict(title=parameter),
+            hovertemplate=f"Date: %{{x}}<br>Hour: %{{y}}<br>{parameter}: %{{z:.2f}}<extra></extra>",
+        )
+    )
+    # D3 tick format
+    d3fmt = DATE_TICK_FORMATS.get(date_fmt_key, "%b-%y")
 
-def find_saved_file(session_id: str) -> str | None:
-    # Prefer memory map
-    info = SESSIONS.get(session_id)
-    if info and os.path.exists(info["file"]):
-        return info["file"]
-    # Fallback to disk (survives code reload in same pod)
-    d = session_upload_dir(session_id)
-    candidates = [os.path.join(d, "data.csv"), os.path.join(d, "data.xlsx")]
-    for c in candidates:
-        if os.path.exists(c):
-            # rehydrate memory map
-            SESSIONS[session_id] = {"file": c}
-            return c
-    return None
+    fig.update_layout(
+        template="plotly_white",
+        height=height,
+        margin=dict(l=60, r=30, t=60, b=80),
+        title=dict(text=f"Single-City Heatmap • {parameter}", x=0.02, xanchor="left"),
+        xaxis=dict(
+            type="date",
+            tickformat=d3fmt,
+            tickfont=dict(size=tickfont_size),
+            title="Date"
+        ),
+        yaxis=dict(
+            title="Hour (0–23)",
+            tickmode="linear",
+            tick0=0,
+            dtick=1,
+            tickfont=dict(size=12),
+        ),
+        # keep chart steady on re-render
+        uirevision="keep",
+    )
+    return fig
 
+def _save_image(fig: go.Figure, width: int, height: int) -> str:
+    os.makedirs("/tmp/plots", exist_ok=True)
+    pid = uuid.uuid4().hex
+    path = f"/tmp/plots/{pid}.jpg"
+    fig.write_image(path, format="jpg", width=width, height=height, scale=1)
+    return pid, path
 
-# ───────────────────────────── Routes ─────────────────────────────
+# -----------------------------------------------------------------------------
+# Routes
+# -----------------------------------------------------------------------------
 @app.route("/", methods=["GET"])
 def home():
-    resp = make_response()
-    session_id, resp = get_or_create_session_id(resp)
-    csv_path = find_saved_file(session_id)
-
-    table_html = None
-    cols = []
-    filename = None
-
-    if csv_path and os.path.exists(csv_path):
-        filename = os.path.basename(csv_path)
-        try:
-            if csv_path.lower().endswith(".csv"):
-                df = pd.read_csv(csv_path)
-            else:
-                df = pd.read_excel(csv_path)
-            cols = df.columns.tolist()
-            # Preview table (first 30 rows)
-            table_html = df.head(30).to_html(
-                classes="table table-sm table-striped table-hover align-middle",
-                index=False,
-                border=0,
-                justify="center",
-            )
-        except Exception:
-            # If read fails, force user to re-upload
-            table_html = None
-            cols = []
-            filename = None
+    # Retrieve prior state (if any)
+    key = _session_key()
+    state = cache.get(key) or {}
 
     return render_template(
         "heatmap_app_00.html",
-        session_id=session_id,
-        filename=filename,
-        columns=cols,
-        preview_table=table_html,
-        graph_html=None,
-        image_url=None,
-        message=None,
-    ), 200, resp.headers
-
+        uploaded_name=state.get("filename"),
+        preview_rows=state.get("preview_rows", []),
+        preview_cols=state.get("preview_cols", 0),
+        plot_html=state.get("plot_html"),
+        plot_id=state.get("plot_id"),
+        defaults=DEFAULTS,
+        # UI default selections
+        selected_param=state.get("parameter", "DBT"),
+        scalemin=state.get("zmin"),
+        scalemax=state.get("zmax"),
+        date_fmt_key=state.get("date_fmt_key", "mon2yr"),
+        img_width=state.get("img_width", 1200),
+        img_height=state.get("img_height", 600),
+        tick_size=state.get("tick_size", 10),
+    )
 
 @app.route("/upload", methods=["POST"])
 def upload():
-    resp = make_response(redirect(url_for("home")))
-    session_id, resp = get_or_create_session_id(resp)
+    f = request.files.get("file")
+    if not f or not f.filename:
+        flash("Please choose a CSV or Excel file.", "warning")
+        return redirect(url_for("home"))
 
-    if "file" not in request.files:
-        flash("Please choose a file.", "warning")
-        return resp
+    try:
+        df = _read_upload(f)
+    except Exception as e:
+        flash(f"Upload failed: {e}", "danger")
+        return redirect(url_for("home"))
 
-    f = request.files["file"]
-    if not f or f.filename.strip() == "":
-        flash("Please choose a file.", "warning")
-        return resp
+    # Cache the cleaned dataframe for this session
+    key = _session_key()
+    state = {
+        "filename": f.filename,
+        "df_json": df.to_json(date_format="iso", orient="split"),
+        "preview_rows": df[REQUIRED_COLS].head(30).values.tolist(),
+        "preview_cols": len(df.columns),
+    }
+    cache.set(key, state)
 
-    ext = os.path.splitext(f.filename)[1].lower()
-    if ext not in ALLOWED_EXT:
-        flash("Only CSV/XLSX files are allowed.", "danger")
-        return resp
-
-    # Save under uploads/<session_id>/data.ext
-    dst_dir = session_upload_dir(session_id)
-    if ext == ".csv":
-        dst = os.path.join(dst_dir, "data.csv")
-    else:
-        dst = os.path.join(dst_dir, "data.xlsx")
-
-    f.save(dst)
-    SESSIONS[session_id] = {"file": dst}
-    flash("File uploaded successfully. Now pick options and generate the heatmap.", "success")
-    return resp
-
+    flash("File uploaded successfully.", "success")
+    return redirect(url_for("home"))
 
 @app.route("/generate-heatmap", methods=["POST"])
 def generate_heatmap():
-    # Session & file
-    session_id = request.cookies.get("session_id")
-    if not session_id:
-        flash("Session expired. Please upload the file again.", "warning")
+    key = _session_key()
+    state = cache.get(key) or {}
+    if "df_json" not in state:
+        flash("Please upload a file first.", "warning")
         return redirect(url_for("home"))
 
-    csv_path = find_saved_file(session_id)
-    if not csv_path:
-        flash("No uploaded file found. Please upload your CSV/XLSX first.", "warning")
-        return redirect(url_for("home"))
+    df = pd.read_json(io.StringIO(state["df_json"]), orient="split")
 
-    # Parameter
-    parameter = request.form.get("parameter", "DBT").strip()
-    if parameter not in ("DBT", "RH"):
-        parameter = "DBT"
+    parameter = request.form.get("parameter", "DBT")
+    zmin = request.form.get("scalemin", "").strip()
+    zmax = request.form.get("scalemax", "").strip()
+    img_width = int(request.form.get("img_width", 1200))
+    img_height = int(request.form.get("img_height", 600))
+    tick_size = int(request.form.get("tick_size", 10))
+    date_fmt_key = request.form.get("date_fmt", "mon2yr")
 
-    # Optional overrides
-    try:
-        vmin = float(request.form.get("scale_min", "").strip()) if request.form.get("scale_min") else None
-    except ValueError:
-        vmin = None
-    try:
-        vmax = float(request.form.get("scale_max", "").strip()) if request.form.get("scale_max") else None
-    except ValueError:
-        vmax = None
-
-    # Defaults based on parameter
-    if vmin is None:
-        vmin = 0.0
-    if vmax is None:
-        vmax = 50.0 if parameter == "DBT" else 100.0
-
-    # Read data
-    if csv_path.lower().endswith(".csv"):
-        df = pd.read_csv(csv_path)
+    # Default scale per variable if empty
+    if zmin == "":
+        zmin = DEFAULTS.get(parameter, {}).get("zmin", 0.0)
     else:
-        df = pd.read_excel(csv_path)
+        zmin = float(zmin)
 
-    # Expect columns: Timestamp, DBT, RH
-    if "Timestamp" not in df.columns:
-        flash("Column 'Timestamp' not found in the uploaded file.", "danger")
-        return redirect(url_for("home"))
-    if parameter not in df.columns:
-        flash(f"Column '{parameter}' not found in the uploaded file.", "danger")
-        return redirect(url_for("home"))
+    if zmax == "":
+        zmax = DEFAULTS.get(parameter, {}).get("zmax", 100.0)
+    else:
+        zmax = float(zmax)
 
-    # Clean & transform
-    df = df.copy()
-    dt = parse_datetime(df["Timestamp"])
-    df = df.loc[~dt.isna()].copy()
-    df["__date__"] = dt.dt.date
-    df["__hour__"] = dt.dt.hour
-    df[parameter] = pd.to_numeric(df[parameter], errors="coerce")
+    # Pivot data
+    pt = _pivot(df, parameter)
 
-    # Pivot: y=hour (0..23), x=date, z=mean(parameter)
-    pivot = df.pivot_table(index="__hour__", columns="__date__", values=parameter, aggfunc="mean")
-    pivot = pivot.sort_index(axis=0)  # hours ascending
-    pivot = pivot.sort_index(axis=1)  # dates ascending
+    # Build figure (on-page figure height a bit smaller for nice fit)
+    fig = _build_fig(pt, parameter, zmin, zmax, date_fmt_key, tick_size, height=480)
 
-    x_labels = [d.strftime("%Y-%m-%d") for d in pivot.columns]
-    y_labels = list(pivot.index)
-
-    # Build figure
-    fig = go.Figure(
-        data=go.Heatmap(
-            z=pivot.values,
-            x=x_labels,
-            y=y_labels,
-            zmin=vmin,
-            zmax=vmax,
-            colorscale=carbse_colorscale(),
-            colorbar=dict(title=parameter),
-            hovertemplate=("Date: %{x}<br>Hour: %{y}<br>" + parameter + ": %{z:.2f}<extra></extra>"),
-        )
-    )
-
-    fig.update_layout(
-        title=f"Single-City Heatmap • {parameter}",
-        margin=dict(l=40, r=20, t=60, b=60),
-        autosize=True,
-        xaxis=dict(tickangle=-45, automargin=True),
-        yaxis=dict(title="Hour (0–23)", automargin=True),
-        template="plotly_white",
-    )
-
-    # Render responsive HTML snippet
-    graph_html = fig.to_html(
-        include_plotlyjs="cdn",
+    # HTML for inline plot (responsive)
+    plot_html = fig.to_html(
         full_html=False,
-        config={"displaylogo": False, "responsive": True}
+        include_plotlyjs="cdn",
+        config={"responsive": True, "displaylogo": False, "modeBarButtonsToRemove": ["lasso2d", "select2d"]},
+        default_height="100%"
     )
 
-    # Save JPG for download
-    jpg_path = os.path.join(PLOT_ROOT, f"{session_id}.jpg")
-    try:
-        fig.write_image(jpg_path, format="jpg", scale=2, width=1400, height=600)
-        image_url = url_for("download_jpg", session_id=session_id)
-    except Exception:
-        # Kaleido might fail for odd fonts; still show chart
-        image_url = None
+    # Save a JPG for download in requested image size
+    pid, path = _save_image(_build_fig(pt, parameter, zmin, zmax, date_fmt_key, tick_size, height=img_height),
+                            width=img_width, height=img_height)
 
-    # Prepare table & columns again for the page
-    try:
-        preview_table = df[["Timestamp", parameter]].head(30).to_html(
-            classes="table table-sm table-striped table-hover align-middle",
-            index=False, border=0, justify="center",
-        )
-        cols = df.columns.tolist()
-        filename = os.path.basename(csv_path)
-    except Exception:
-        preview_table = None
-        cols, filename = [], None
+    # Update state & return
+    state.update({
+        "plot_html": plot_html,
+        "plot_id": pid,
+        "parameter": parameter,
+        "zmin": zmin, "zmax": zmax,
+        "date_fmt_key": date_fmt_key,
+        "img_width": img_width,
+        "img_height": img_height,
+        "tick_size": tick_size,
+    })
+    cache.set(key, state)
+    return redirect(url_for("home"))
 
-    return render_template(
-        "heatmap_app_00.html",
-        session_id=session_id,
-        filename=filename,
-        columns=cols,
-        preview_table=preview_table,
-        graph_html=graph_html,
-        image_url=image_url,
-        message=None,
-        default_vmin=vmin,
-        default_vmax=vmax,
-        selected_param=parameter,
-    )
-
-
-@app.route("/download/jpg/<session_id>", methods=["GET"])
-def download_jpg(session_id):
-    jpg_path = os.path.join(PLOT_ROOT, f"{session_id}.jpg")
-    if not os.path.exists(jpg_path):
-        flash("No plot image available. Please generate a heatmap first.", "warning")
+@app.route("/download/jpg/<plot_id>", methods=["GET"])
+def download_jpg(plot_id):
+    path = f"/tmp/plots/{plot_id}.jpg"
+    if not os.path.exists(path):
+        flash("Image not found. Please re-generate the heatmap.", "warning")
         return redirect(url_for("home"))
-    return send_file(jpg_path, mimetype="image/jpeg", as_attachment=True, download_name="heatmap.jpg")
+    return send_file(path, mimetype="image/jpeg", as_attachment=True, download_name="heatmap.jpg")
 
-
-@app.route("/healthz", methods=["GET"])
-def healthz():
-    return "ok", 200
-
-
-# ───────────────────────────── Main ─────────────────────────────
+# -----------------------------------------------------------------------------
+# Entrypoint (for local runs)
+# -----------------------------------------------------------------------------
 if __name__ == "__main__":
-    # Local dev
-    app.run(host="0.0.0.0", port=5000, debug=True)
+    app.run(debug=True, host="0.0.0.0", port=int(os.environ.get("PORT", 5000)))
