@@ -1,459 +1,355 @@
-# -*- coding: utf-8 -*-
-"""
-CARBSE Heatmap Generator (Type 1) – full UI, session-safe (single-city)
-Flask + Plotly + Pandas + Kaleido
-"""
-
 import os
 import uuid
 from datetime import datetime
-
-from flask import (
-    Flask, render_template, request, send_file, jsonify, redirect, url_for
-)
-from werkzeug.utils import secure_filename
+from typing import Dict, Any, List
 
 import numpy as np
 import pandas as pd
+from flask import (
+    Flask, render_template, request, redirect, url_for,
+    session, send_file
+)
 import plotly.graph_objects as go
+import plotly.io as pio
 
-# --------------------------------------------------------------------------------------
-# App & folders
-# --------------------------------------------------------------------------------------
-app = Flask(__name__, template_folder="Templates")
+# -------------------------------------------------------
+# App setup
+# -------------------------------------------------------
+app = Flask(__name__)
+app.secret_key = os.environ.get("FLASK_SECRET_KEY", "carbse-heatmap-secret")
+app.config["TEMPLATES_AUTO_RELOAD"] = True
 
-BASE_DIR   = os.path.abspath(os.path.dirname(__file__))
-UPLOAD_DIR = os.path.join(BASE_DIR, "uploads")
-PLOT_DIR   = os.path.join(BASE_DIR, "plots")
-TEMPLATE_DIR = os.path.join(BASE_DIR, "Templates")
+PLOT_DIR = os.path.join(os.getcwd(), "plots")
+os.makedirs(PLOT_DIR, exist_ok=True)
 
-os.makedirs(UPLOAD_DIR, exist_ok=True)
-os.makedirs(PLOT_DIR,   exist_ok=True)
+# In-memory cache per session (OK with 1 gunicorn worker)
+CACHE: Dict[str, Dict[str, Any]] = {}
 
-# Map session_id -> info
-SESSION_STORE = {}  # { session_id: {"file": path, "df_head_html": str} }
-
-# --------------------------------------------------------------------------------------
+# -------------------------------------------------------
 # Helpers
-# --------------------------------------------------------------------------------------
-def read_csv_safely(csv_path: str) -> pd.DataFrame:
-    """Read CSV and try to parse 'Timestamp' robustly."""
-    df = pd.read_csv(csv_path)
+# -------------------------------------------------------
+def get_sid() -> str:
+    """Get (or set) a simple session id."""
+    if "sid" not in session:
+        session["sid"] = str(uuid.uuid4())
+    return session["sid"]
 
-    # Normalise headers we expect: Timestamp, DBT, RH (case-insensitive OK)
-    # We'll keep original names if present, but try canonical aliases.
-    col_map = {c.lower(): c for c in df.columns}
-    # Mandatory Timestamp
-    ts_col = None
-    for key in ["timestamp", "time", "date_time", "datetime"]:
-        if key in col_map:
-            ts_col = col_map[key]
-            break
-    if ts_col is None:
-        # Fall back to the most likely 'Timestamp'
-        ts_col = "Timestamp" if "Timestamp" in df.columns else df.columns[0]
+def parse_timestamp(series: pd.Series) -> pd.Series:
+    """
+    Parse a 'Timestamp' column robustly.
+    """
+    # Try fast path
+    dt = pd.to_datetime(series, errors="coerce")
+    # If too many NaT, try dayfirst=True
+    nat_ratio = dt.isna().mean()
+    if nat_ratio > 0.3:
+        dt = pd.to_datetime(series, errors="coerce", dayfirst=True)
+    return dt
 
-    # Ensure Timestamp is datetime
-    # (remove deprecated infer_datetime_format)
-    if not np.issubdtype(df[ts_col].dtype, np.datetime64):
-        try:
-            dt = pd.to_datetime(df[ts_col], errors="coerce")
-            bad = dt.isna().sum()
-            df[ts_col] = dt
-        except Exception:
-            # Final fallback: try dayfirst
-            dt = pd.to_datetime(df[ts_col], errors="coerce", dayfirst=True)
-            df[ts_col] = dt
+COLOR_MAP = {
+    "White":    "#FFFFFF",
+    "Navyblue": "#001f3f",
+    "Blue":     "#0074D9",
+    "Cyan":     "#00FFFF",
+    "Yellow":   "#FFFF00",
+    "Red":      "#FF4136",
+    "Darkred":  "#990000",
+    "Black":    "#000000",
+}
 
-    # Rename to canonical names we’ll use downstream (but keep original available)
-    if ts_col != "Timestamp":
-        df = df.rename(columns={ts_col: "Timestamp"})
-    # Standardise possible variants for DBT / RH
-    for want, candidates in {
-        "DBT": ["dbt", "drybulb", "dry_bulb", "temp", "temperature", "airtemp", "dry bulb temperature"],
-        "RH":  ["rh", "relhum", "relative_humidity", "rel humidity", "humidity"]
-    }.items():
-        if want not in df.columns:
-            for c in df.columns:
-                if c.lower() in candidates:
-                    df = df.rename(columns={c: want})
-                    break
+MISSING_COLORS = {
+    "Grey":  "#BDBDBD",
+    "White": "#FFFFFF",
+    "Black": "#000000",
+}
 
-    # Add Hour (0..23) for pivot
-    df["Hour"] = df["Timestamp"].dt.hour
+DATE_FMT = {
+    "mon2y": "%b-%y",           # Jan-17
+    "ddmon": "%d-%b",           # 01-Jan
+    "ddmonfull": "%d-%B",       # 01-January
+    "mon3": "%b",               # Jan
+    "dow3": "%a",               # Mon
+    "dowfull": "%A",            # Monday
+    "mm": "%m",                 # 01
+    "yyyy": "%Y",               # 2017
+    "ddmmyy": "%d-%m-%y",       # 01-01-17
+}
 
-    # For safety, sort by time
-    df = df.sort_values("Timestamp").reset_index(drop=True)
-    return df
+def build_colorscale(selected: List[str]) -> List[List[Any]]:
+    """Plotly colorscale from ordered color names."""
+    if not selected:
+        selected = ["White", "Blue", "Cyan", "Yellow", "Red", "Black"]
+    cs = [COLOR_MAP.get(c, "#000000") for c in selected]
+    if len(cs) == 1:
+        cs = [cs[0], cs[0]]
+    return [[i / (len(cs) - 1), c] for i, c in enumerate(cs)]
 
+def human_tick_text(dates: List[pd.Timestamp], fmt_key: str) -> (List[str], List[pd.Timestamp]):
+    fmt = DATE_FMT.get(fmt_key, "%b-%y")
+    ticktext = [d.strftime(fmt) for d in dates]
+    return ticktext, dates
 
-def colorscale_from_names(names):
-    """Build a Plotly colorscale list from selected colour names."""
-    if not names:
-        return "Viridis"
+def add_band_line(fig: go.Figure, hour: float, style: str, color: str):
+    if hour is None:
+        return
+    dash = "dot" if style == "dotted" else "solid"
+    fig.add_hline(y=hour, line_dash=dash, line_color=color, opacity=0.8)
 
-    # Base palette
-    palette = {
-        "white":   "#FFFFFF",
-        "navyblue":"#001f4d",
-        "blue":    "#1f77b4",
-        "cyan":    "#17becf",
-        "yellow":  "#ffea00",
-        "red":     "#ff4136",
-        "darkred": "#8B0000",
-        "black":   "#000000",
-        "grey":    "#808080",
-        "gray":    "#808080",
-    }
-
-    chosen = []
-    for n in names:
-        key = n.strip().lower()
-        if key in palette:
-            chosen.append(palette[key])
-
-    if len(chosen) < 2:
-        return "Viridis"
-
-    # even-spaced [0..1]
-    stops = np.linspace(0, 1, len(chosen)).tolist()
-    colorscale = [[float(s), c] for s, c in zip(stops, chosen)]
-    return colorscale
-
-
-def x_tickformat_from_choice(choice: str) -> str:
-    """Map radio choice to Plotly time tickformat."""
-    mapping = {
-        "Jan-17":        "%b-%y",
-        "01-Jan":        "%d-%b",
-        "01-01-17":      "%d-%m-%y",
-        "01-January":    "%d-%B",
-        "Mon":           "%a",
-        "Monday":        "%A",
-        "Jan":           "%b",
-        "01":            "%m",
-        "17":            "%y",
-        "2017":          "%Y",
-    }
-    return mapping.get(choice, "%b-%y")
-
-
-def x_dtick_from_resolution(reso: str) -> str:
-    """Plotly time dtick strings."""
-    reso = (reso or "").lower()
-    if reso == "days":
-        return "D1"
-    if reso == "weeks":
-        return "D7"    # pseudo-week
-    if reso == "months":
-        return "M1"
-    if reso == "years":
-        return "M12"
-    return None
-
-
-def css_dash(style: str) -> str:
-    style = (style or "dotted").lower()
-    return {"dotted": "dot", "dashed": "dash", "solid": "solid"}.get(style, "dot")
-
-
-# --------------------------------------------------------------------------------------
+# -------------------------------------------------------
 # Routes
-# --------------------------------------------------------------------------------------
+# -------------------------------------------------------
 @app.route("/", methods=["GET"])
 def home():
-    # fresh session
+    sid = get_sid()
+    data = CACHE.get(sid, {})
+    df = data.get("df")
+
+    data_html = None
+    detected = []
+    if df is not None:
+        preview = df.head(100).copy()
+        data_html = preview.to_html(
+            classes="table table-striped table-sm table-hover mb-0",
+            index=False, border=0
+        )
+        detected = list(df.columns)
+
     return render_template(
         "heatmap_app_00.html",
-        session_id="",
-        graph_html="",
-        table_html="",
-        state=default_state()
+        has_data=df is not None,
+        detected_cols=detected,
+        data_html=data_html,
+        plot_html=None,
+        last_plot_id=None,
     )
-
 
 @app.route("/upload", methods=["POST"])
 def upload():
-    f = request.files.get("file")
-    if not f or f.filename == "":
-        return render_template(
-            "heatmap_app_00.html",
-            session_id="",
-            graph_html="",
-            table_html="<div class='text-danger'>Please choose a CSV.</div>",
-            state=default_state()
-        )
+    sid = get_sid()
+    file = request.files.get("file")
+    if not file or file.filename == "":
+        return redirect(url_for("home"))
 
-    sid = str(uuid.uuid4())
-    sdir = os.path.join(UPLOAD_DIR, sid)
-    os.makedirs(sdir, exist_ok=True)
+    try:
+        if file.filename.lower().endswith((".xlsx", ".xls")):
+            df = pd.read_excel(file)
+        else:
+            df = pd.read_csv(file)
+    except Exception:
+        # try with cp1252 fallback
+        file.stream.seek(0)
+        df = pd.read_csv(file, encoding="cp1252")
 
-    fname = secure_filename(f.filename)
-    fpath = os.path.join(sdir, fname)
-    f.save(fpath)
+    # normalize expected columns
+    # Expected headers: Timestamp, DBT, RH   (case-insensitive accepted)
+    lower = {c.lower(): c for c in df.columns}
+    if "timestamp" in lower and lower["timestamp"] != "Timestamp":
+        df.rename(columns={lower["timestamp"]: "Timestamp"}, inplace=True)
+    if "dbt" in lower and lower["dbt"] != "DBT":
+        df.rename(columns={lower["dbt"]: "DBT"}, inplace=True)
+    if "rh" in lower and lower["rh"] != "RH":
+        df.rename(columns={lower["rh"]: "RH"}, inplace=True)
 
-    df = read_csv_safely(fpath)
+    if "Timestamp" not in df.columns:
+        # try "Date" or "Datetime"
+        for cand in ["Date", "Datetime", "Time", "time"]:
+            if cand in df.columns:
+                df.rename(columns={cand: "Timestamp"}, inplace=True)
+                break
 
-    # small table preview
-    table_html = df.head(100).to_html(
-        classes="table table-sm table-striped table-hover mb-0", index=False, border=0
-    )
+    # parse timestamp
+    df["Timestamp"] = parse_timestamp(df["Timestamp"])
+    df = df.dropna(subset=["Timestamp"]).reset_index(drop=True)
 
-    SESSION_STORE[sid] = {"file": fpath, "table_html": table_html}
-
-    # Pre-populate scale max based on default variable (DBT)
-    st = default_state()
-    st["session_id"] = sid
-
-    return render_template(
-        "heatmap_app_00.html",
-        session_id=sid,
-        graph_html="",
-        table_html=table_html,
-        state=st,
-    )
-
-
-def default_state():
-    """Default UI values (used to repopulate form)."""
-    return {
-        "variable": "DBT",
-        "scale_min": "",
-        "scale_max": "",
-        "img_w": "1200",
-        "img_h": "600",
-
-        "missing_color": "grey",
-        "range_colors": ["white", "navyblue", "blue", "cyan", "yellow", "red", "darkred", "black"],
-
-        "legend_step": "",
-        "x_tickfmt": "Jan-17",
-        "x_resolution": "months",
-
-        "title": "",
-        "x_label": "Date",
-        "y_label": "Hour",
-        "legend_label": "",
-
-        "upper_time": "09:00",
-        "upper_style": "dotted",
-        "upper_color": "black",
-
-        "lower_time": "18:00",
-        "lower_style": "dotted",
-        "lower_color": "black",
-
-        "show_grid": "yes"
+    CACHE[sid] = {
+        "df": df,
+        "fname": file.filename,
+        "last_plot_id": None,
     }
-
+    return redirect(url_for("home"))
 
 @app.route("/generate-heatmap", methods=["POST"])
 def generate_heatmap():
-    form = default_state()
-    # Capture posted values (fall back to defaults)
-    session_id = request.form.get("session_id", "").strip()
-
-    # if session missing, go back nicely
-    if not session_id or session_id not in SESSION_STORE:
-        # Graceful redirect to home with a message (but we keep simple)
+    sid = get_sid()
+    data = CACHE.get(sid, {})
+    df = data.get("df")
+    if df is None:
         return redirect(url_for("home"))
 
-    # update state
-    for key in form.keys():
-        if key in request.form:
-            val = request.form.getlist(key) if key == "range_colors" else request.form.get(key)
-            form[key] = val
+    # ----- form values -----
+    param = request.form.get("variable", "DBT")
+    legend_name = request.form.get("legend_name") or param
 
-    # Load data
-    file_path = SESSION_STORE[session_id]["file"]
-    df = read_csv_safely(file_path)
-
-    # Select variable
-    parameter = (form["variable"] or "DBT").strip()
-    if parameter not in df.columns:
-        # If missing, try case-insensitive
-        matches = [c for c in df.columns if c.lower() == parameter.lower()]
-        parameter = matches[0] if matches else "DBT"
-
-    # Build pivot: Hours vs Date
-    # We'll plot one cell per (date, hour)
-    df["Date"] = df["Timestamp"].dt.date
-    pivot = df.pivot_table(index="Hour", columns="Date", values=parameter, aggfunc="mean")
-    x_vals = list(pivot.columns)
-    y_vals = list(pivot.index)
-
-    # Colour scale
-    colorscale = colorscale_from_names(form["range_colors"])
-
-    # Scale min / max
-    cmin = None
-    cmax = None
-    if (form["scale_min"] or "").strip():
+    # scaling
+    vmin = request.form.get("scale_min", "").strip()
+    vmax = request.form.get("scale_max", "").strip()
+    try:
+        zmin = float(vmin) if vmin != "" else 0.0
+    except ValueError:
+        zmin = 0.0
+    if vmax == "":
+        zmax = 50.0 if param.upper() == "DBT" else 100.0
+    else:
         try:
-            cmin = float(form["scale_min"])
-        except Exception:
-            cmin = None
-    if (form["scale_max"] or "").strip():
+            zmax = float(vmax)
+        except ValueError:
+            zmax = 50.0 if param.upper() == "DBT" else 100.0
+
+    # sizes (used only for JPG)
+    img_w = int(request.form.get("image_width") or 1200)
+    img_h = int(request.form.get("image_height") or 600)
+
+    # bands
+    def _parse_time(s):
+        s = (s or "").strip()
+        if not s:
+            return None
         try:
-            cmax = float(form["scale_max"])
-        except Exception:
-            cmax = None
-
-    # Legend step → explicit ticks
-    tickvals = None
-    if (form["legend_step"] or "").strip():
-        try:
-            step = float(form["legend_step"])
-            if step > 0:
-                vmin = cmin if cmin is not None else np.nanmin(pivot.values)
-                vmax = cmax if cmax is not None else np.nanmax(pivot.values)
-                tickvals = list(np.arange(vmin, vmax + step, step))
-        except Exception:
-            pass
-
-    # Hover template (escape %{...} with doubled braces in f-string)
-    hovertemplate = f"Date: %{{x}}<br>Hour: %{{y}}<br>{parameter}: %{{z:.2f}}<extra></extra>"
-
-    # Build figure
-    heatmap_kwargs = dict(
-        z=pivot.values,
-        x=x_vals,
-        y=y_vals,
-        colorscale=colorscale,
-        colorbar=dict(title=form["legend_label"] or parameter),
-        hovertemplate=hovertemplate,
-        hoverongaps=True
-    )
-    if cmin is not None:
-        heatmap_kwargs["zmin"] = cmin
-    if cmax is not None:
-        heatmap_kwargs["zmax"] = cmax
-
-    fig = go.Figure(data=go.Heatmap(**heatmap_kwargs))
-
-    # Gridlines
-    show_grid = (form["show_grid"] or "yes").lower() == "yes"
-    fig.update_xaxes(showgrid=show_grid)
-    fig.update_yaxes(showgrid=show_grid)
-
-    # Date tick format & spacing
-    tickformat = x_tickformat_from_choice(form["x_tickfmt"])
-    fig.update_xaxes(tickformat=tickformat)
-
-    dtick = x_dtick_from_resolution(form["x_resolution"])
-    if dtick:
-        fig.update_xaxes(dtick=dtick)
-
-    # Upper/lower band lines (times in HH:MM across entire width)
-    def parse_hour(hhmm):
-        try:
-            t = datetime.strptime(hhmm.strip(), "%H:%M")
+            t = datetime.strptime(s, "%H:%M")
             return t.hour + t.minute / 60.0
         except Exception:
             return None
 
-    upper_h = parse_hour(form["upper_time"])
-    lower_h = parse_hour(form["lower_time"])
+    upper_time = _parse_time(request.form.get("upper_band_time"))
+    upper_style = request.form.get("upper_band_style", "dotted")
+    upper_color = request.form.get("upper_band_color", "black")
 
-    x0 = x_vals[0] if x_vals else None
-    x1 = x_vals[-1] if x_vals else None
+    lower_time = _parse_time(request.form.get("lower_band_time"))
+    lower_style = request.form.get("lower_band_style", "dotted")
+    lower_color = request.form.get("lower_band_color", "black")
 
-    if x0 is not None and x1 is not None:
-        if upper_h is not None:
-            fig.add_shape(
-                type="line", x0=x0, x1=x1, y0=upper_h, y1=upper_h,
-                line=dict(color=form["upper_color"], width=1.5, dash=css_dash(form["upper_style"])),
-                xref="x", yref="y"
-            )
-        if lower_h is not None:
-            fig.add_shape(
-                type="line", x0=x0, x1=x1, y0=lower_h, y1=lower_h,
-                line=dict(color=form["lower_color"], width=1.5, dash=css_dash(form["lower_style"])),
-                xref="x", yref="y"
-            )
+    # colors
+    missing_color_name = request.form.get("missing_color", "Grey")
+    missing_color = MISSING_COLORS.get(missing_color_name, "#BDBDBD")
+    selected_colors = request.form.getlist("colors")
+    colorscale = build_colorscale(selected_colors)
 
-    # Background colour used as "missing colour" (transparent cells let this show)
-    bg = form["missing_color"] or "white"
+    # text
+    title = request.form.get("title") or f"Heatmap ({param})"
+    x_name = request.form.get("x_name") or "Date"
+    y_name = request.form.get("y_name") or "Hour"
 
-    # Legend ticks
-    if tickvals:
-        fig.update_traces(colorbar=dict(tickmode="array", tickvals=tickvals, ticktext=[str(t) for t in tickvals]))
+    # date axis
+    date_fmt_key = request.form.get("date_fmt", "mon2y")
+    x_repr = request.form.get("x_repr", "months")   # months | days
 
-    # Layout
-    try:
-        w = int(form["img_w"])
-    except Exception:
-        w = 1200
-    try:
-        h = int(form["img_h"])
-    except Exception:
-        h = 600
+    # ------------- pivot -------------
+    df = df.copy()
+    df["Hour"] = df["Timestamp"].dt.hour
+    df["DateOnly"] = df["Timestamp"].dt.floor("D")
 
+    # Aggregate to mean per Hour x Date
+    pv = pd.pivot_table(
+        df, index="Hour", columns="DateOnly", values=param, aggfunc="mean"
+    ).sort_index().sort_index(axis=1)
+
+    hours = pv.index.to_list()
+    dates = list(pv.columns)  # Timestamp (midnight)
+    z = pv.values
+
+    # ------------- plotting -------------
+    fig = go.Figure()
+
+    # Main heatmap
+    fig.add_trace(go.Heatmap(
+        x=dates,
+        y=hours,
+        z=z,
+        colorscale=colorscale,
+        zmin=zmin,
+        zmax=zmax,
+        colorbar=dict(title=legend_name),
+        hoverongaps=False,
+        hovertemplate=f"Date: %{{x|%b %d, %Y}}<br>Hour: %{{y}}:00<br>{legend_name}: %{{z:.2f}}<extra></extra>",
+        showscale=True,
+    ))
+
+    # Overlay for NaN cells with a single-color heatmap (does not change scale)
+    nan_mask = ~np.isfinite(z)
+    if nan_mask.any():
+        z_nan = np.where(nan_mask, 1.0, np.nan)
+        fig.add_trace(go.Heatmap(
+            x=dates,
+            y=hours,
+            z=z_nan,
+            colorscale=[[0, missing_color], [1, missing_color]],
+            showscale=False,
+            hoverinfo="skip",
+            opacity=1.0
+        ))
+
+    # bands
+    add_band_line(fig, upper_time, upper_style, upper_color)
+    add_band_line(fig, lower_time, lower_style, lower_color)
+
+    # layout (web: responsive width; jpg: fixed)
     fig.update_layout(
-        title=form["title"],
-        xaxis_title=form["x_label"] or "Date",
-        yaxis_title=form["y_label"] or "Hour",
-        width=w, height=h,
-        paper_bgcolor="white",
-        plot_bgcolor=bg,
-        margin=dict(l=40, r=40, t=60, b=60)
+        title=dict(text=title, x=0.02, xanchor="left"),
+        xaxis=dict(title=x_name, ticks="outside"),
+        yaxis=dict(title=y_name, range=[-0.5, 23.5]),
+        width=None,           # responsive
+        height=img_h,
+        autosize=True,
+        margin=dict(l=60, r=60, t=50, b=60),
+        template="plotly_white",
     )
 
-    # Save HTML & JPG for download
-    html_path = os.path.join(PLOT_DIR, f"{session_id}.html")
-    jpg_path  = os.path.join(PLOT_DIR, f"{session_id}.jpg")
+    # X-axis ticks
+    if x_repr == "months":
+        fig.update_xaxes(dtick="M1")
+    else:
+        fig.update_xaxes(dtick="D1")
 
-    # HTML inline + CDN
-    graph_html = fig.to_html(include_plotlyjs="cdn", full_html=False)
+    # custom tick text formatting
+    if dates:
+        ticktext, tickvals = human_tick_text(dates, date_fmt_key)
+        fig.update_xaxes(ticktext=ticktext, tickvals=tickvals)
 
-    # JPG for download
-    try:
-        import kaleido  # noqa
-        fig.write_image(jpg_path, format="jpg", scale=2)
-    except Exception:
-        # if kaleido not present or fails, we still render HTML
-        jpg_path = None
+    # HTML (responsive)
+    graph_html = pio.to_html(
+        fig, full_html=False, include_plotlyjs="cdn",
+        config={"responsive": True, "displaylogo": False}
+    )
 
-    # Table preview
-    table_html = SESSION_STORE[session_id].get("table_html", "")
+    # JPG
+    plot_id = str(uuid.uuid4())
+    jpg_path = os.path.join(PLOT_DIR, f"{plot_id}.jpg")
+    fig_img = go.Figure(fig)
+    fig_img.update_layout(width=img_w, height=img_h)
+    # scale=2 for crisper image
+    fig_img.write_image(jpg_path, scale=2)
 
-    # Also stash plot path (optional)
-    SESSION_STORE[session_id]["plot_jpg"] = jpg_path
+    # update cache & render
+    data["last_plot_id"] = plot_id
+    CACHE[sid] = data
 
-    # Re-render template with state retained
-    form["session_id"] = session_id
+    # preview table again (Data tab)
+    preview = CACHE[sid]["df"].head(100)
+    data_html = preview.to_html(
+        classes="table table-striped table-sm table-hover mb-0",
+        index=False, border=0
+    )
+    detected = list(CACHE[sid]["df"].columns)
+
     return render_template(
         "heatmap_app_00.html",
-        session_id=session_id,
-        graph_html=graph_html,
-        table_html=table_html,
-        state=form
+        has_data=True,
+        detected_cols=detected,
+        data_html=data_html,
+        plot_html=graph_html,
+        last_plot_id=plot_id,
     )
 
+@app.route("/download/jpg/<plot_id>")
+def download_jpg(plot_id):
+    file_path = os.path.join(PLOT_DIR, f"{plot_id}.jpg")
+    if not os.path.exists(file_path):
+        return redirect(url_for("home"))
+    return send_file(file_path, as_attachment=True, download_name="heatmap.jpg")
 
-@app.route("/download/jpg/<session_id>")
-def download_jpg(session_id):
-    info = SESSION_STORE.get(session_id)
-    if not info:
-        return "Invalid session", 404
-    jpg_path = info.get("plot_jpg")
-    if not jpg_path or not os.path.exists(jpg_path):
-        return "No image to download. Generate a heatmap first.", 404
-    return send_file(jpg_path, as_attachment=True, download_name="heatmap.jpg")
-
-
-@app.route("/download/csv/<session_id>")
-def download_csv(session_id):
-    info = SESSION_STORE.get(session_id)
-    if not info:
-        return "Invalid session", 404
-    csv_path = info["file"]
-    return send_file(csv_path, as_attachment=True, download_name=os.path.basename(csv_path))
-
-
-# --------------------------------------------------------------------------------------
-# Main
-# --------------------------------------------------------------------------------------
+# -------------------------------------------------------
+# Local run
+# -------------------------------------------------------
 if __name__ == "__main__":
-    # local run
-    app.run(debug=True, use_reloader=False)
+    # For local testing
+    app.run(host="0.0.0.0", port=5000, debug=True)
