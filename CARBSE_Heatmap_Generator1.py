@@ -20,7 +20,8 @@ PLOTS_DIR  = BASE_DIR / "plots"
 for d in (UPLOAD_DIR, PLOTS_DIR):
     d.mkdir(exist_ok=True, parents=True)
 
-app = Flask(__name__, template_folder="templates")
+# near the top, after imports
+app = Flask(__name__, template_folder="Templates")
 app.secret_key = os.environ.get("FLASK_SECRET", "carbse-heatmap-secret")
 
 # -----------------------------------------------------------------------------
